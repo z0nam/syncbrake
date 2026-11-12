@@ -213,12 +213,18 @@ class GoogleDriveDriver:
         res = subprocess.run([str(bin_p), "--pause_syncing"], capture_output=True, text=True, timeout=10.0)
         out = (res.stdout or "") + (res.stderr or "")
         ok = "status: OK" in out or res.returncode == 0
+
+        # Also suspend runaway Spotlight / Siri Suggestion indexers if they are hammering FileProvider
+        if platform.system().lower() == "darwin":
+            for daemon in ("corespotlightd", "suggestd"):
+                subprocess.run(["killall", "-STOP", daemon], capture_output=True)
+
         return {
             "ok": ok,
             "driver": self.id,
             "action": "pause",
             "state": "PAUSED" if ok else st.state,
-            "message": "Paused Google Drive syncing via IPC (--pause_syncing)" if ok else out.strip()[:200],
+            "message": "Paused Google Drive (--pause_syncing) + suspended Spotlight/Suggestd FileProvider scan" if ok else out.strip()[:200],
         }
 
     def resume(self) -> dict[str, Any]:
@@ -229,6 +235,10 @@ class GoogleDriveDriver:
         if not st.running and platform.system().lower() == "darwin":
             subprocess.run(["open", "-g", "-a", "Google Drive"], capture_output=True)
             time.sleep(5.0)
+
+        if platform.system().lower() == "darwin":
+            for daemon in ("corespotlightd", "suggestd"):
+                subprocess.run(["killall", "-CONT", daemon], capture_output=True)
 
         res = subprocess.run([str(bin_p), "--resume_syncing"], capture_output=True, text=True, timeout=10.0)
         out = (res.stdout or "") + (res.stderr or "")
