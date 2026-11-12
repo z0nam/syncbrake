@@ -1,12 +1,13 @@
 # SyncBrake (`syncbrake` / `sb`) — 설계 및 아키텍처 문서 (Planning & Design Spec)
 
 > **"Put the brakes on background sync & battery drain — without freezing your filesystem."**  
-> 출장·이동·테더링 환경에서 맥(macOS)과 윈도우(Windows)의 배터리 및 핫스팟 데이터를 지키는 **앱 인지형(App-Aware) 동기화·백그라운드 제어기 & AI 에이전트 친화적 CLI/트레이 도구**
+> 출장·이동·테더링 환경에서 **macOS · Windows · Linux** (및 Tailscale로 묶인 멀티 노드 환경)의 배터리 및 핫스팟 데이터를 지키는 **앱 인지형(App-Aware) 동기화·백그라운드 제어기 & AI 에이전트 친화적 CLI/트레이 도구**
 
 - **GitHub Repository**: [`https://github.com/z0nam/syncbrake`](https://github.com/z0nam/syncbrake)
 - **Local Path**: `~/dev/syncbrake`
 - **Primary CLI**: `syncbrake` (단축 별칭: `sb`)
-- **Target OS**: macOS (Intel & Apple Silicon) / Windows 10 & 11
+- **Target OS**: **macOS** (Intel & Apple Silicon) / **Windows** 10 & 11 / **Linux** (Ubuntu/Debian/Arch/Fedora, Desktop & Headless Server)
+- **Tailnet Integration**: Tailscale (`tailscale status --json`) 연동으로 내 테일넷 내 맥·윈도우·리눅스 피어 간 P2P 동기화 트래픽 감지 및 원격 노드 제어(`sb fleet`) 지원
 - **Tech Stack**: Python 3.11+ (`uv` 기반 패키징) + Cross-platform System Tray & Window UI (`pystray` + `pywebview` / `Textual` TUI)
 
 ---
@@ -59,21 +60,23 @@ flowchart TD
         DRV["5. App-Aware Driver Registry"]
     end
 
-    subgraph OS_Backends["OS Platform Abstraction (macOS & Windows)"]
+    subgraph OS_Backends["OS Platform Abstraction (macOS · Windows · Linux)"]
         MAC["macOS Backend\nioreg, pmset, lsappinfo, launchd, scutil"]
         WINOS["Windows Backend\nWin32_Battery, powercfg, Task Scheduler, WlanApi"]
+        LINUX["Linux Backend\n/sys/class/power_supply, systemd-inhibit, systemd --user, nmcli, nvidia-smi"]
+        TS["Tailscale Mesh Awareness\ntailscale status --json, P2P Sync Peer Detection & Remote Control"]
     end
 
     subgraph Target_Apps["제어 대상 앱 & 데몬 (Drivers)"]
-        GD["Google Drive\n(IPC --pause_syncing)"]
-        RS["Resilio Sync / Syncthing\n(Graceful Quit / REST Pause)"]
+        GD["Google Drive / Insync / rclone\n(IPC --pause_syncing / CLI)"]
+        RS["Resilio Sync / Syncthing\n(Graceful Quit / systemd / REST Pause)"]
         OD["OneDrive / Dropbox\n(Native CLI / IPC)"]
-        DEV["Docker / WSL2 / Ollama / VS Code"]
-        SYS["Spotlight (mds) / photoanalysisd / Windows Search"]
+        DEV["Docker / WSL2 / Ollama / GPU Workers"]
+        SYS["Spotlight (mds) / photoanalysisd / Windows Search / tracker-miner"]
     end
 
     CLI & TRAY & WIN & MCP --> Core
-    PROBE & INSPECT & SCHED --> MAC & WINOS
+    PROBE & INSPECT & SCHED --> MAC & WINOS & LINUX & TS
     DRV --> GD & RS & OD & DEV & SYS
 ```
 
@@ -83,30 +86,32 @@ flowchart TD
 
 ### 4.1 모듈 1: 스마트 전원·상황 감지 (`syncbrake.probe`)
 
-단순 `AC vs Battery` 이분법을 넘어 실제 물리적 전력 흐름과 네트워크 환경을 판별한다.
+단순 `AC vs Battery` 이분법을 넘어 **macOS · Windows · Linux** 3대 OS의 실제 물리적 전력 흐름과 네트워크(핫스팟 및 Tailscale 터널) 환경을 판별한다.
 
-| 감지 항목 | macOS 구현 방식 | Windows 구현 방식 | 판별 로직 |
-| :--- | :--- | :--- | :--- |
-| **실시간 배터리 충·방전 전력(W)** | `ioreg -rn AppleSmartBattery` (`Voltage × Amperage`) | WMI `BatteryStatus` (`Voltage`, `DischargeRate`, `ChargeRate`) | 순방전량(`Net Watts`) 및 예상 잔여 시간 계산 |
-| **어댑터 협상 출력(W)** | `AppleRawAdapterDetails` (`Watts`, `AdapterVoltage`, `Current`) | PD Controller / WMI PowerSupply | 저출력 포트(`8W~30W`) 여부 감지 |
-| **80% 충전 제한 (Sailing Mode) 구분** | `UISoc >= charge_limit (기본 80%)` + `ExternalConnected=Yes` + `IsCharging=No` | OEM Battery Charge Threshold + `ACLineStatus=1` | **`SOC >= 80%`에서 비충전 방전 중이면 정상 콘센트(Sailing Mode)로 판정**하여 오작동 방지 |
-| **보조배터리 / 저출력 어댑터 판정** | `SOC < 80%` 인데 `AdapterWatts < 45W` 또는 `NetAmperage < 0` | `SOC < 80%` 인데 `DischargeRate > 0` on AC | 또는 사용자가 수동으로 `sb mode powerbank` 토글 시 강제 활성 |
-| **핫스팟 / 종량제 네트워크 감지** | `ipconfig` / `scutil --nwi` (`172.20.10.x` iPhone 핫스팟, Wi-Fi Low Data Mode, Bluetooth PAN) | `Windows.Networking.Connectivity` (`NetworkCostType == Variable/Fixed`) | 테더링 연결 시 즉시 `hotspot` 정책 트리거 가능 |
+| 감지 항목 | macOS 구현 방식 | Windows 구현 방식 | Linux 구현 방식 | 판별 로직 |
+| :--- | :--- | :--- | :--- | :--- |
+| **실시간 배터리 충·방전 전력(W)** | `ioreg -rn AppleSmartBattery` (`Voltage × Amperage`) | WMI `BatteryStatus` (`Voltage`, `DischargeRate`, `ChargeRate`) | `/sys/class/power_supply/BAT*` (`power_now` 또는 `voltage_now × current_now`) / `upower` | 순방전량(`Net Watts`) 및 예상 잔여 시간 계산 |
+| **어댑터 협상 출력(W)** | `AppleRawAdapterDetails` (`Watts`, `AdapterVoltage`, `Current`) | PD Controller / WMI PowerSupply | `/sys/class/power_supply/ucsi*` 또는 `AC/online` + Type-C PD sysfs | 저출력 포트(`8W~30W`) 여부 감지 |
+| **80% 충전 제한 (Sailing Mode) 구분** | `UISoc >= charge_limit (기본 80%)` + `ExternalConnected=Yes` + `IsCharging=No` | OEM Battery Charge Threshold + `ACLineStatus=1` | `/sys/class/power_supply/BAT*/charge_control_end_threshold` (예: `80`) + `status=Not charging` | **`SOC >= 80%`에서 비충전 방전 중이면 정상 콘센트(Sailing Mode)로 판정**하여 오작동 방지 |
+| **보조배터리 / 저출력 어댑터 판정** | `SOC < 80%` 인데 `AdapterWatts < 45W` 또는 `NetAmperage < 0` | `SOC < 80%` 인데 `DischargeRate > 0` on AC | `SOC < threshold` 인데 `AC/online=1` 이면서 `status=Discharging` | 또는 사용자가 수동으로 `sb powerbank on` 토글 시 강제 활성 |
+| **핫스팟 / 종량제 네트워크 감지** | `ipconfig` / `scutil --nwi` (`172.20.10.x` iPhone 핫스팟, Wi-Fi Low Data Mode) | `Windows.Networking.Connectivity` (`NetworkCostType == Variable/Fixed`) | `nmcli -t -f GENERAL.METERED dev show` (`yes`/`guessed-yes`) 또는 `172.20.10.x` | 테더링 연결 시 즉시 `hotspot` 정책 트리거 가능 |
+| **Tailscale 피어 트래픽 감지** | `tailscale status --json` + `lsof` (`utun*` / `100.x.y.z`) | `tailscale status --json` + `Get-NetTCPConnection` | `tailscale status --json` + `ss -tupn` (`tailscale0`) | 핫스팟/배터리 상태에서 Tailscale을 타고 다른 윈/맥/리눅스 노드로 흐르는 P2P 동기화(Resilio, Syncthing, SMB/NFS 등) 즉시 식별 |
 
 ### 4.2 모듈 2: 앱 인지형 안전 드라이버 (`syncbrake.drivers`)
 
-Finder나 탐색기 프리징을 절대 유발하지 않는 앱별 맞춤 제어 드라이버를 제공한다.
+Finder, 탐색기, Linux 파일 매니저 프리징을 절대 유발하지 않는 앱별 맞춤 제어 드라이버를 제공한다.
 
-| 드라이버 ID | 대상 앱 | 일시정지 (`pause`) 동작 | 재개 (`resume`) 동작 | 비고 |
+| 드라이버 ID | 대상 앱 (OS) | 일시정지 (`pause`) 동작 | 재개 (`resume`) 동작 | 비고 |
 | :--- | :--- | :--- | :--- | :--- |
-| `gdrive` | **Google Drive** | `Google Drive --pause_syncing` (macOS) / `--pause_syncing` IPC (Win) | `Google Drive --resume_syncing` (꺼져 있으면 기동 후 전송) | CloudStorage 마운트 유지, CPU 즉시 0% |
-| `resilio` | **Resilio Sync** | `SIGTERM` 정상 종료 (피어 탐색 UDP/TCP 소켓 완전 닫기) | 백그라운드 재실행 (`open -g -a "Resilio Sync"` / `Start-Process`) | 일반 로컬 폴더이므로 종료해도 파일 접근 무관 |
-| `onedrive` | **Microsoft OneDrive** | `/pause` 플래그 또는 메뉴 IPC (안 되면 `/shutdown`) | `/background` 플래그로 백그라운드 기동 | Windows/macOS 공통 지원 |
-| `dropbox` | **Dropbox** | Dropbox CLI / IPC 일시정지 또는 정상 종료 | 백그라운드 재기동 | |
-| `syncthing` | **Syncthing** | REST API `POST /rest/system/pause` | REST API `POST /rest/system/resume` | |
-| `ollama` | **Ollama (Local LLM)** | 실행 중인 모델 언로드 (`ollama stop`) 및 서버 중지 | 필요 시 서비스 재시작 | VRAM 및 유휴 전력 확보 |
-| `docker` | **Docker / OrbStack / WSL2** | 비필수 컨테이너 일시정지 또는 VM 정지 (`orb stop` / `wsl --shutdown`) | 서비스 재기동 | 선택적(Opt-in) 드라이버 |
-| `sys_index` | **OS 백그라운드 인덱서** | `photoanalysisd` 억제, 저전력 모드(`lowpowermode 1`) 전환 | 원래 전원 설정 복원 | |
+| `gdrive` | **Google Drive** (macOS/Win) | `Google Drive --pause_syncing` IPC | `Google Drive --resume_syncing` (꺼져 있으면 기동 후 전송) | CloudStorage 마운트 유지, CPU 즉시 0% |
+| `insync` / `rclone` | **Insync / rclone** (Linux/macOS/Win) | `insync pause_syncing` / `rclone rc core/bwlimit rate=off` | `insync resume_syncing` / `rclone rc core/bwlimit rate=off` 해제 | Linux 데스크톱/서버 구글 드라이브 클라이언트 지원 |
+| `resilio` | **Resilio Sync** (macOS/Win/Linux) | `SIGTERM` 정상 종료 또는 `systemctl --user stop resilio-sync` | 백그라운드 재실행 (`open -g -a` / `Start-Process` / `systemctl --user start`) | Tailscale 경유 P2P 소켓(`10241`)까지 완전히 닫음 |
+| `onedrive` | **OneDrive** (macOS/Win/Linux) | `/pause` 플래그 또는 `systemctl --user stop onedrive` | `/background` 기동 또는 `systemctl --user start onedrive` | 3대 OS 공통 지원 |
+| `dropbox` | **Dropbox** (macOS/Win/Linux) | `dropbox stop` / IPC 일시정지 | `dropbox start` / 백그라운드 재기동 | |
+| `syncthing` | **Syncthing** (macOS/Win/Linux) | REST API `POST /rest/system/pause` (특정 Tailscale 피어만 일시정지도 가능) | REST API `POST /rest/system/resume` | |
+| `ollama` | **Ollama (Local LLM)** (3대 OS) | 실행 중인 모델 언로드 (`ollama stop`) 및 유휴화 | 요청 시 자동 로드 또는 서비스 재시작 | VRAM 및 GPU 유휴 전력 확보 |
+| `docker` | **Docker / OrbStack / WSL2** | 비필수 컨테이너 pause 또는 `orb stop` / `wsl --shutdown` | 서비스 재기동 | 선택적(Opt-in) 드라이버 |
+| `sys_index` | **OS 백그라운드 인덱서** | macOS `lowpowermode 1` / Win Search / Linux `tracker3 daemon -t` & `powerprofilesctl set power-saver` | 원래 전원 프로필 및 인덱서 복원 | |
 
 ### 4.3 모듈 3: 배터리 상위 소모 앱 인스펙터 & 선택 제어 (`syncbrake.top`)
 
@@ -147,6 +152,16 @@ Finder나 탐색기 프리징을 절대 유발하지 않는 앱별 맞춤 제어
 - **OS 네이티브 등록**:
   - **macOS**: `~/Library/LaunchAgents/com.z0nam.syncbrake.schedule.plist` 생성 (`StartCalendarInterval` + `WatchPaths: /Library/Preferences/SystemConfiguration` + `StartInterval`). 복구 완료 시 스스로 `bootout` 및 `.plist` 삭제.
   - **Windows**: `schtasks` / Task Scheduler API를 통해 Time Trigger + Network State Change Event(`Microsoft-Windows-NetworkProfile/Operational` Event ID 10000) 등록 후 완료 시 자동 삭제.
+  - **Linux**: `systemd --user` 타이머(`~/.config/systemd/user/syncbrake-resume.timer` & `.service`) + NetworkManager dispatcher 연동으로 등록 후 복구 완료 시 `systemctl --user disable --now` 자동 정리.
+
+### 4.6 보너스 모듈: Tailscale 멀티 노드 연동 (`syncbrake.tailnet`)
+
+동일한 Tailscale 테일넷에 물려 있는 **Windows · macOS · Linux** 머신들을 통합 인지한다.
+
+- **출장 중 테일넷 피어 동기화 폭주 차단**:
+  - 노트북이 핫스팟/배터리 상태로 전환되면, 현재 Tailscale 인터페이스(`utun*` / `tailscale0` / `100.x.y.z`)를 통해 집/연구실의 Linux 서버나 Windows 데스크톱과 통신 중인 백그라운드 프로세스(Resilio Sync `10241`, Syncthing `22000`, 원격 데스크톱 Parsec 등)를 정확히 집어내어 일시정지한다.
+- **`sb fleet` (테일넷 전체 노드 상태 조회 및 원격 제어)**:
+  - `tailscale status --json`으로 온라인 피어(Win/Mac/Linux)를 찾고, SSH/Tailscale을 통해 각 노드의 `sb status --json`을 수집하거나 특정 원격 노드에서도 동기화/무거운 작업을 잠시 멈추게(`sb --host <node> pause`) 명령할 수 있다.
 
 ---
 
@@ -183,12 +198,16 @@ sb trim --auto                                # 화이트리스트 외 추천 �
 # 6. 보조배터리(Power Bank) 수동/자동 모드 토글
 sb powerbank on                               # 현재 AC로 잡혀 있어도 보조배터리 모드로 강제 간주
 
-# 7. UI 실행 (메뉴바/트레이 또는 독립 창 또는 TUI)
-sb tray                                       # 메뉴바(macOS) / 시스템 트레이(Windows) 상주 실행
-sb window                                     # 데스크톱 대시보드 창으로 띄우기
-sb tui                                        # 터미널 내 대화형 TUI 실행
+# 7. Tailscale 테일넷 멀티 노드(Win/Mac/Linux) 연동
+sb fleet                                      # 테일넷 내 온라인 노드(맥/윈/리눅스) 및 P2P 트래픽 상태 조회
+sb --host lab-linux status                    # 원격 리눅스/윈도우 노드의 syncbrake 상태 확인
 
-# 8. AI 에이전트용 MCP 서버 실행
+# 8. UI 실행 (메뉴바/트레이 또는 독립 창 또는 TUI)
+sb tray                                       # 메뉴바(macOS) / 시스템 트레이(Windows·Linux) 상주 실행
+sb window                                     # 데스크톱 대시보드 창으로 띄우기
+sb tui                                        # 터미널 내 대화형 TUI 실행 (SSH/리눅스 서버에서도 동일 UX)
+
+# 9. AI 에이전트용 MCP 서버 실행
 sb mcp
 ```
 
@@ -252,14 +271,17 @@ syncbrake/
         ├── config.py              # ~/.config/syncbrake/config.yaml 로더
         ├── probe/
         │   ├── __init__.py
-        │   ├── base.py            # PowerState, NetworkState 데이터 모델
+        │   ├── base.py            # PowerState, NetworkState, TailscalePeer 데이터 모델
         │   ├── macos.py           # ioreg, pmset, scutil, 80% Sailing 감지
-        │   └── windows.py         # WMI, GetSystemPowerStatus, powercfg, Metered Wi-Fi 감지
+        │   ├── windows.py         # WMI, GetSystemPowerStatus, powercfg, Metered Wi-Fi 감지
+        │   ├── linux.py           # /sys/class/power_supply, upower, systemd-inhibit, nmcli, nvidia-smi
+        │   └── tailnet.py         # tailscale status --json 및 테일넷 P2P 소켓 매핑
         ├── drivers/
         │   ├── __init__.py
         │   ├── base.py            # SyncDriver 추상 클래스 (status, pause, resume, is_installed)
         │   ├── gdrive.py          # Google Drive (--pause_syncing / --resume_syncing)
-        │   ├── resilio.py         # Resilio Sync 제어
+        │   ├── insync_rclone.py   # Insync / rclone (Linux/Cross-platform Google Drive)
+        │   ├── resilio.py         # Resilio Sync 제어 (macOS/Win/Linux systemd)
         │   ├── onedrive.py        # OneDrive 제어
         │   ├── dropbox.py         # Dropbox 제어
         │   └── daemons.py         # Ollama, Docker, 인덱서 제어
@@ -272,7 +294,8 @@ syncbrake/
         ├── scheduler/
         │   ├── __init__.py
         │   ├── macos_launchd.py   # launchd plist 생성/로드/자동 정리
-        │   └── win_schtasks.py    # Windows Task Scheduler 등록/정리
+        │   ├── win_schtasks.py    # Windows Task Scheduler 등록/정리
+        │   └── linux_systemd.py   # systemd --user timer & NetworkManager dispatcher 등록/정리
         ├── ui/
         │   ├── tray.py            # 메뉴바 / 시스템 트레이 상주 UI
         │   ├── window.py          # 독립 창 대시보드 UI

@@ -1,7 +1,7 @@
 # ⚡ SyncBrake (`syncbrake` / `sb`)
 
 > **Put the brakes on background sync & battery drain — without freezing your filesystem.**  
-> Smart battery & hotspot saver for **macOS** and **Windows** with App-Aware cloud sync pausing, PD power-bank & 80%-charge-limit awareness, scheduled auto-resume, and an AI-agent-ready CLI + Menu Bar / Tray UI.
+> Smart battery & hotspot saver for **macOS**, **Windows**, and **Linux** (with **Tailscale tailnet** awareness) — featuring App-Aware cloud sync pausing, PD power-bank & 80%-charge-limit awareness, scheduled auto-resume, and an AI-agent-ready CLI + Menu Bar / Tray / TUI.
 
 ---
 
