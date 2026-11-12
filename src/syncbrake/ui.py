@@ -97,8 +97,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <button class="success" onclick="apiCall('/api/resume')">▶ 지금 모두 재개</button>
     </div>
     <div class="btn-row">
-      <button class="primary" onclick="apiCall('/api/schedule?from=16:00&until=24:00')">⏰ 16:00~24:00 일시정지 (자정 후 온라인 재개)</button>
-      <button onclick="apiCall('/api/schedule?until=24:00')">🌙 지금 정지 → 자정 후 온라인 재개</button>
+      <button class="primary" onclick="apiCall('/api/schedule?until=1h')">⏰ 1시간 일시정지</button>
+      <button class="primary" onclick="apiCall('/api/schedule?until=2h')">⏰ 2시간 일시정지</button>
+      <button class="primary" onclick="apiCall('/api/schedule?until=4h')">⏰ 4시간 일시정지</button>
+    </div>
+    <div class="btn-row" style="align-items:center;">
+      <input id="sched-from" placeholder="시작 (예: 16:00, 비우면 즉시)" style="background:#11141c;color:#fff;border:1px solid #363f54;padding:6px 8px;border-radius:6px;width:170px;font-size:12px;">
+      <span>~</span>
+      <input id="sched-until" placeholder="재개 (예: 24:00 또는 3h)" value="2h" style="background:#11141c;color:#fff;border:1px solid #363f54;padding:6px 8px;border-radius:6px;width:155px;font-size:12px;">
+      <button onclick="customSchedule()">예약 적용</button>
+      <button onclick="apiCall('/api/cancel_schedule')">예약 취소</button>
     </div>
     <div class="btn-row">
       <button onclick="apiCall('/api/preset?name=trip')">🧳 출장(Trip) 프리셋</button>
@@ -183,6 +191,13 @@ async function apiCall(url) {
   await refreshState();
 }
 
+async function customSchedule() {
+  const f = document.getElementById('sched-from').value.trim();
+  const u = document.getElementById('sched-until').value.trim() || '2h';
+  const q = f ? `from=${encodeURIComponent(f)}&until=${encodeURIComponent(u)}` : `until=${encodeURIComponent(u)}`;
+  await apiCall('/api/schedule?' + q);
+}
+
 refreshState();
 setInterval(refreshState, 5000);
 </script>
@@ -262,9 +277,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "results": res})
         elif parsed.path == "/api/schedule":
             from_t = qs.get("from", [None])[0]
-            until_t = qs.get("until", ["24:00"])[0]
+            until_t = qs.get("until", ["2h"])[0]
             res = schedule_window_or_until(from_hhmm=from_t, until_hhmm=until_t, when_online=True)
             self._send_json(res)
+        elif parsed.path == "/api/cancel_schedule":
+            self._send_json(cancel_schedule())
         elif parsed.path == "/api/preset":
             name = qs.get("name", ["trip"])[0]
             self._send_json(apply_preset(name))
@@ -360,12 +377,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "SyncBrake — \(pmode) (\(soc)% \(wStr))", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Google Drive: \(gdState)", action: nil, keyEquivalent: ""))
+
+        if let sched = obj["schedule"] as? [String: Any],
+           let active = sched["active"] as? Bool, active {
+            let resumeStr = sched["resume_after_str"] as? String ?? ""
+            menu.addItem(NSMenuItem(title: "⏰ 예약됨: \(resumeStr) 이후 자동 재개", action: nil, keyEquivalent: ""))
+            let cancelItem = NSMenuItem(title: "✖ 예약 취소 (Cancel Schedule)", action: #selector(cancelSched), keyEquivalent: "")
+            cancelItem.target = self
+            menu.addItem(cancelItem)
+        }
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(NSMenuItem(title: "⏸ 지금 모두 일시정지 (Pause All)", action: #selector(pauseAll), keyEquivalent: "p"))
         menu.addItem(NSMenuItem(title: "▶ 지금 모두 재개 (Resume All)", action: #selector(resumeAll), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "⏰ 16:00~24:00 일시정지 (자정 후 온라인 재개)", action: #selector(sched16to24), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "🌙 자정까지 일시정지 (자정 후 온라인 재개)", action: #selector(schedMidnight), keyEquivalent: ""))
+
+        // Submenu for timed pause & custom schedule
+        let schedMenu = NSMenu()
+        let s1h = NSMenuItem(title: "1시간 뒤 자동 재개 (1h)", action: #selector(sched1h), keyEquivalent: "")
+        let s2h = NSMenuItem(title: "2시간 뒤 자동 재개 (2h)", action: #selector(sched2h), keyEquivalent: "")
+        let s4h = NSMenuItem(title: "4시간 뒤 자동 재개 (4h)", action: #selector(sched4h), keyEquivalent: "")
+        let sCustom = NSMenuItem(title: "시간/구간 직접 입력... (예: 3h, 09:00, 14:00~18:00)", action: #selector(schedCustom), keyEquivalent: "")
+        for it in [s1h, s2h, s4h, sCustom] {
+            it.target = self
+            schedMenu.addItem(it)
+        }
+        let schedRoot = NSMenuItem(title: "⏰ 예약 일시정지 (Schedule Pause)", action: nil, keyEquivalent: "")
+        schedRoot.submenu = schedMenu
+        menu.addItem(schedRoot)
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(NSMenuItem(title: "🧳 프리셋: 출장 모드 (Trip)", action: #selector(presetTrip), keyEquivalent: ""))
@@ -378,15 +416,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "✖ 메뉴바 종료 (Quit Tray)", action: #selector(quitApp), keyEquivalent: "q"))
 
         for item in menu.items {
-            item.target = self
+            if item.target == nil && item.action != nil {
+                item.target = self
+            }
         }
         statusItem.menu = menu
     }
 
     @objc func pauseAll() { _ = runSB(["pause"]); updateStatus() }
-    @objc func resumeAll() { _ = runSB(["resume"]); updateStatus() }
-    @objc func sched16to24() { _ = runSB(["pause", "--from", "16:00", "--until", "24:00", "--when-online"]); updateStatus() }
-    @objc func schedMidnight() { _ = runSB(["pause", "--until", "24:00", "--when-online"]); updateStatus() }
+    @objc func resumeAll() { _ = runSB(["resume", "--cancel-schedule"]); updateStatus() }
+    @objc func cancelSched() { _ = runSB(["resume", "--cancel-schedule"]); updateStatus() }
+    @objc func sched1h() { _ = runSB(["pause", "--until", "1h", "--when-online"]); updateStatus() }
+    @objc func sched2h() { _ = runSB(["pause", "--until", "2h", "--when-online"]); updateStatus() }
+    @objc func sched4h() { _ = runSB(["pause", "--until", "4h", "--when-online"]); updateStatus() }
+    @objc func schedCustom() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "⏰ 동기화 일시정지 & 자동 재개 예약"
+        alert.informativeText = "재개 시각/시간(예: 2h, 30m, 09:00, 24:00) 또는 구간(예: 14:00~18:00)을 입력하세요.\n지정 시각 이후 온라인 상태일 때 자동 재개됩니다."
+        alert.addButton(withTitle: "예약 적용")
+        alert.addButton(withTitle: "취소")
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        input.stringValue = "2h"
+        alert.accessoryView = input
+        if alert.runModal() == .alertFirstButtonReturn {
+            let val = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if val.contains("~") || val.contains("-") {
+                let sep: Character = val.contains("~") ? "~" : "-"
+                let parts = val.split(separator: sep).map { String($0).trimmingCharacters(in: .whitespaces) }
+                if parts.count == 2 {
+                    _ = runSB(["pause", "--from", parts[0], "--until", parts[1], "--when-online"])
+                }
+            } else if !val.isEmpty {
+                _ = runSB(["pause", "--until", val, "--when-online"])
+            }
+            updateStatus()
+        }
+    }
     @objc func presetTrip() { _ = runSB(["preset", "trip"]); updateStatus() }
     @objc func presetHotspot() { _ = runSB(["preset", "hotspot"]); updateStatus() }
     @objc func presetWork() { _ = runSB(["preset", "work"]); updateStatus() }
