@@ -353,9 +353,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 gdState = d["state"] as? String ?? "STOPPED"
             }
         }
-        let icon = (gdState == "PAUSED") ? "⏸" : "⚡"
+        let icon = (gdState == "PAUSED") ? "⏸⚡" : "⚡"
         let wStr = String(format: "%+.0fW", watts)
-        statusItem.button?.title = "\(icon) \(soc)% \(wStr)"
+        statusItem.button?.title = "\(icon)\(soc)%"
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "SyncBrake — \(pmode) (\(soc)% \(wStr))", action: nil, keyEquivalent: ""))
@@ -404,9 +404,35 @@ app.run()
 
 def launch_macos_menubar_tray() -> dict[str, Any]:
     cache_dir = Path.home() / ".cache" / "syncbrake"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    app_bundle = cache_dir / "SyncBrakeTray.app"
+    contents_dir = app_bundle / "Contents"
+    macos_dir = contents_dir / "MacOS"
+    macos_dir.mkdir(parents=True, exist_ok=True)
+
     swift_src = cache_dir / "SyncBrakeTray.swift"
-    bin_path = cache_dir / "SyncBrakeTray"
+    bin_path = macos_dir / "SyncBrakeTray"
+    plist_path = contents_dir / "Info.plist"
+
+    plist_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>SyncBrakeTray</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.z0nam.syncbrake.tray</string>
+    <key>CFBundleName</key>
+    <string>SyncBrakeTray</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>
+"""
+    plist_path.write_text(plist_xml, encoding="utf-8")
 
     if not bin_path.exists() or swift_src.read_text(encoding="utf-8", errors="ignore") != SWIFT_TRAY_SOURCE:
         swift_src.write_text(SWIFT_TRAY_SOURCE, encoding="utf-8")
@@ -419,5 +445,5 @@ def launch_macos_menubar_tray() -> dict[str, Any]:
             return {"ok": False, "error": res.stderr}
 
     subprocess.run(["killall", "SyncBrakeTray"], capture_output=True)
-    subprocess.Popen([str(bin_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {"ok": True, "binary": str(bin_path), "message": "Launched native macOS Menu Bar icon (SyncBrakeTray)"}
+    subprocess.run(["/usr/bin/open", "-a", str(app_bundle)], capture_output=True)
+    return {"ok": True, "app_bundle": str(app_bundle), "message": "Launched native macOS Menu Bar app (SyncBrakeTray.app)"}
