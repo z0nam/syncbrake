@@ -97,7 +97,23 @@ flowchart TD
 | **핫스팟 / 종량제 네트워크 감지** | `ipconfig` / `scutil --nwi` (`172.20.10.x` iPhone 핫스팟, Wi-Fi Low Data Mode) | `Windows.Networking.Connectivity` (`NetworkCostType == Variable/Fixed`) | `nmcli -t -f GENERAL.METERED dev show` (`yes`/`guessed-yes`) 또는 `172.20.10.x` | 테더링 연결 시 즉시 `hotspot` 정책 트리거 가능 |
 | **Tailscale 피어 트래픽 감지** | `tailscale status --json` + `lsof` (`utun*` / `100.x.y.z`) | `tailscale status --json` + `Get-NetTCPConnection` | `tailscale status --json` + `ss -tupn` (`tailscale0`) | 핫스팟/배터리 상태에서 Tailscale을 타고 다른 윈/맥/리눅스 노드로 흐르는 P2P 동기화(Resilio, Syncthing, SMB/NFS 등) 즉시 식별 |
 
-### 4.2 모듈 2: 앱 인지형 안전 드라이버 (`syncbrake.drivers`)
+### 4.2 모듈 2: 앱 인지형 안전 드라이버 (`syncbrake.drivers`) & Tier-0 Google Drive (`DriveFS`) 심층 제어
+
+#### 🎯 Tier-0 Core Target: Google Drive (`DriveFS`) 심층 제어
+실측 결과 노트북 배터리와 CPU를 가장 심각하게 소모하는 주범(단독 CPU 100%+ 및 커널·인덱서 연쇄 폭주 유발)은 **Google Drive(`DriveFS`)**이며, 공식 앱에 '일시정지 예약/자동 재개' 기능이 없어 수동으로 껐다가 다시 켜는 것을 잊어버리는 문제가 가장 빈번하다. 따라서 `syncbrake`는 Google Drive 제어를 **Tier-0 핵심 기능**으로 다룬다.
+
+1. **히든 IPC 플래그 제어 (`--pause_syncing` / `--resume_syncing`)**
+   - `SIGSTOP`을 쓰지 않고 DriveFS 내장 IPC 파이프(`/tmp/drivefs_ipc.<uid>` 또는 Windows Named Pipe)로 명령을 전달해 `~/Library/CloudStorage/GoogleDrive-*` 마운트는 완벽히 유지하면서 CPU 점유율을 즉시 0%로 낮춘다.
+2. **Google Drive '실제 총 부하(True Footprint)' 합산 계측**
+   - `Google Drive` 본체뿐만 아니라 자식 프로세스(`Google Drive Helper (Renderer)`, `Google Drive Helper (GPU)`, `DFSFileProviderExtension`, `FinderSyncExtension`)와 이로 인해 유발된 커널 인덱서(`mds`, `mdsync`, `corespotlightd`, `fileproviderd`)의 CPU 점유율 및 추정 전력(W)을 합산해 보여준다.
+3. **다중 계정(Multi-Account) 및 로컬 WAL 폭주 진단**
+   - `~/Library/Application Support/Google/DriveFS` (또는 `%LOCALAPPDATA%\Google\DriveFS`) 내 연결된 계정 수와 `metrics_store_sqlite.db-wal` / `Logs/drive_fs.txt` 상태를 파싱해 현재 실제 동기화 상태(`PAUSED` vs `SYNCING`)를 정확히 판별한다.
+4. **버전 만료일(`deprecation_date`) 사전 감지 & 원클릭 업그레이드 (`sb gdrive upgrade`)**
+   - DriveFS 바이너리/로그에 내장된 `deprecation_date`(출시 후 약 1년)와 `current_drive_fs_version`을 읽어, 업데이터 누락으로 만료 경고가 뜨기 전에 미리 알려주거나 CLI에서 즉시 최신 `GoogleDrive.dmg` / 설치본으로 무인 업데이트(`sb gdrive upgrade`)를 수행한다.
+5. **작업 디렉토리 가드 (Workdir Sync Guard)**
+   - 현재 터미널이나 AI 에이전트(Claude Code, Antigravity, Codex)가 `GoogleDrive-*` 경로 내부에서 빌드·Git·학습 작업을 수행 중일 때 파일 변경 폭주를 감지하고 일시정지/디바운스(Debounce)를 제안한다.
+
+#### 전체 드라이버 매트릭스
 
 Finder, 탐색기, Linux 파일 매니저 프리징을 절대 유발하지 않는 앱별 맞춤 제어 드라이버를 제공한다.
 
